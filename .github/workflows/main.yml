@@ -1,0 +1,128 @@
+name: Danory GPT v7 training
+on:
+  workflow_dispatch:
+    inputs:
+      steps_this_run:
+        description: "Additional optimizer steps in this run; resume keeps the same total LR schedule"
+        required: true
+        default: "1200"
+        type: string
+      naab_train_rows:
+        description: "Maximum NAAM training paragraphs to stream"
+        required: true
+        default: "300000"
+        type: string
+      naab_test_rows:
+        description: "Maximum NAAM test paragraphs"
+        required: true
+        default: "20000"
+        type: string
+      merged_rows:
+        description: "Additional PersianCorpus_merged paragraphs (0 disables; default 50000)"
+        required: true
+        default: "50000"
+        type: string
+      naab_train_shards:
+        description: "NAAM train shard indexes (comma-separated; 0-125)"
+        required: true
+        default: "0"
+        type: string
+      naab_test_shards:
+        description: "NAAM test shard indexes (comma-separated; 0-2; default 2 is smallest)"
+        required: true
+        default: "2"
+        type: string
+      resume_run_id:
+        description: "Previous successful run ID (leave empty for fresh training)"
+        required: false
+        default: ""
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  train:
+    # Public standard runner: 4 CPU / 16 GB RAM / 14 GB SSD; no GPU.
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+      - name: Restore prior resume bundle
+        if: ${{ inputs.resume_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: danory-v7-resume
+          run-id: ${{ inputs.resume_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: resume_bundle
+      - name: Cache prepared public corpus
+        uses: actions/cache@v4
+        with:
+          path: data/public
+          key: danory-v7-naab-${{ inputs.naab_train_shards }}-${{ inputs.naab_train_rows }}-${{ inputs.naab_test_shards }}-${{ inputs.naab_test_rows }}-merged-${{ inputs.merged_rows }}-${{ hashFiles('scripts/prepare_public_data.py') }}
+      - name: Prepare public Persian data
+        run: |
+          if [ ! -f data/public/train.jsonl ] || [ ! -f data/public/validation.jsonl ]; then
+            python scripts/prepare_public_data.py \
+              --naab-train "${{ inputs.naab_train_rows }}" \
+              --naab-test "${{ inputs.naab_test_rows }}" \
+              --merged-rows "${{ inputs.merged_rows }}" \
+              --train-shards "${{ inputs.naab_train_shards }}" \
+              --test-shards "${{ inputs.naab_test_shards }}" \
+              --sft-limit 50000
+          else
+            echo "Using cached public corpus."
+          fi
+      - name: Restore exact tokenizer from previous run
+        if: ${{ inputs.resume_run_id != '' }}
+        run: |
+          mkdir -p data/tokenizer
+          cp resume_bundle/tokenizer.json data/tokenizer/tokenizer.json
+          cp resume_bundle/tokenizer_report.json data/tokenizer/tokenizer_report.json
+      - name: Build tokenizer for fresh training
+        if: ${{ inputs.resume_run_id == '' }}
+        run: |
+          python build_tokenizer.py --input data/public/train.jsonl --out data/tokenizer --vocab-size 16000 --max-chars 200000000
+      - name: Verify model and data
+        run: |
+          python scripts/model_info.py
+          python scripts/preflight.py
+          python -m compileall -q danory train.py generate.py scripts
+      - name: Run tensor smoke test
+        run: python scripts/smoke_test.py
+      - name: Restore resumable checkpoint
+        if: ${{ inputs.resume_run_id != '' }}
+        run: |
+          mkdir -p checkpoints
+          cp resume_bundle/pretrain_last.pt checkpoints/pretrain_last.pt
+      - name: Train from scratch or resume
+        run: |
+          if [ -f checkpoints/pretrain_last.pt ]; then
+            python train.py --stage pretrain --steps-this-run "${{ inputs.steps_this_run }}" --resume checkpoints/pretrain_last.pt
+          else
+            python train.py --stage pretrain --steps-this-run "${{ inputs.steps_this_run }}"
+          fi
+      - name: Prepare resume bundle
+        if: always()
+        run: |
+          mkdir -p artifact_bundle
+          if [ -f checkpoints/pretrain_last.pt ]; then cp checkpoints/pretrain_last.pt artifact_bundle/; fi
+          cp data/tokenizer/tokenizer.json artifact_bundle/ 2>/dev/null || true
+          cp data/tokenizer/tokenizer_report.json artifact_bundle/ 2>/dev/null || true
+      - name: Upload checkpoint and tokenizer
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: danory-v7-resume
+          path: artifact_bundle/
+          if-no-files-found: warn
+          retention-days: 1
