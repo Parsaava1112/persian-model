@@ -14,7 +14,7 @@
   "min_lr": 3e-05,
   "weight_decay": 0.1,
   "warmup_steps": 500,
-  "max_steps": 7000,
+  "max_steps": 8000,
   "eval_interval": 100,
   "eval_batches": 30,
   "save_interval": 100,
